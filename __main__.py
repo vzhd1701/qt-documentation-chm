@@ -1,16 +1,15 @@
 import argparse
 import re
 import shutil
-import subprocess
-from os.path import abspath
+import os
+
+from os.path import abspath, isdir
+
+from lxml import etree, html
+from path import Path
 
 import chm
-from lxml import etree, html
-from path import path as Path
 
-SOURCE = Path('complete\\source').abspath()
-OUTPUT = Path('complete\\output').abspath()
-CHM = chm.DocChm('Qt-5.7.0', default_topic='qtdoc/index.html', title='Qt 5.7.0')
 
 def can_skip_section(section):
     for sec in section.findall('section'):
@@ -39,9 +38,15 @@ def parse_file_toc(file, parent):
             a = li.find('a')
             title = html.tostring(a, encoding='unicode', method='text').strip()
             href = a.get('href')
+
+            # qtcore\qromancalendar.html has one <a href="#"></a> TOC entry that doesn't make any sense
+            if href[0] == '#' and not title:
+                continue
+
             if href[0] == '#':
                 href = file.basename() + href
             href = OUTPUT.relpathto(file.dirname() / href)
+
             if level > prev_level:
                 stack.append(prev_item)
             elif level < prev_level:
@@ -59,6 +64,11 @@ def parse_file_toc(file, parent):
                 doccolumn_toc = parent.append(title, OUTPUT.relpathto(file))
                 for li in doccolumn.findall('ul/li'):
                     a = li.find('a')
+
+                    # Some entries are missing as links sometimes
+                    if a is None:
+                        continue
+
                     href = a.get('href')
                     if href.startswith('http://doc.qt.io'):
                         continue
@@ -70,7 +80,20 @@ def process_section(elem, parent, module):
         title = section.get('title').strip()
         # title could be empty
         if title:
+            # Workaround, there is only 1 glitch like this so far in qtdatavisualization\qtdatavis3d.qhp
+            if not section.get('ref'):
+                if module.basename() == "qtdatavisualization" and title == "Getting Started":
+                    section.set("ref", "qtdatavisualization-index.html")
+                else:
+                    raise RuntimeError(f"Empty reference in {module}")
+
             href = module.basename() / section.get('ref')
+
+            # skip entries referencing deprecated stuff
+            file_path = SOURCE / href
+            if not file_path.exists():
+                continue
+
             child_toc = parent.append(title, href)
         else:
             child_toc = parent
@@ -80,6 +103,7 @@ def process_section(elem, parent, module):
             parse_file_toc(OUTPUT / href, child_toc)
 
 def process_qhp(file, module):
+    # print('Processing QHP', file)
     with open(file, encoding='utf-8'):
         tree = etree.parse(file)
     toc = tree.xpath('//toc')
@@ -96,37 +120,61 @@ def process_qhp(file, module):
                 continue
 
             href = module.basename() / keyword.get('ref')
+
+            # skip keywords referencing deprecated stuff
+            file_path = SOURCE / href.partition("#")[0]
+            if not file_path.exists():
+                continue
+
             title = keyword.get('ref')
             index.append(name, href, title)
 
 def process_resource(dir, output_dir):
     if dir.basename() == 'style':
         return
+
     target = output_dir / dir.basename()
+
     if not target.exists():
-        print('Copying', dir)
+        # print('Copying', dir)
         shutil.copytree(dir, target)
+
     for file in target.files():
+        if dir.basename() == 'images' and file.basename() in STYLE_IMAGES:
+            os.remove(file)
+            continue
+
         CHM.append(OUTPUT.relpathto(file))
 
+    # remove image directory that only had style pics
+    if target.basename() == 'images' and not target.files():
+        os.rmdir(target)
+
 style_re = re.compile(r'<link.*?</script>', re.S)
+root_link = re.compile(r'(<div class="navigationbar">\s*<table><tr>\s*)<td >([^<]*?)</td>', re.M)
 
 def process_html(file, output_dir):
-    global args
     target = output_dir / file.basename()
-    if not target.exists() or args.force:
-        print('Processing', file)
+    if not target.exists():
+        # print('Processing HTML', file)
         with open(file, encoding='utf-8') as r, open(target, 'w', encoding='utf-8') as w:
             content = r.read()
             # remove stylesheet set via javascript
-            content = style_re.sub('<link rel="stylesheet" type="text/css" href="../style.css" />', content, 1)
+            content = style_re.sub('<link rel="stylesheet" type="text/css" href="../{}" />'.format(STYLE_FILE.basename()), content, 1)
+
+            # fix missing root href in navigation bar
+            root_link_match = root_link.search(content)
+            if root_link_match:
+                content = root_link.sub(root_link_match.group(1) + '<td ><a href="../qtdoc/index.html">' + root_link_match.group(2) + '</a></td>', content, 1)
+
             # remove empty paragraph after navigation button
             content = content.replace('</p><p/>', '</p>')
             w.write(content)
     CHM.append(OUTPUT.relpathto(target))
 
 def process_module(module):
-    print(module)
+    print("Processing module", module)
+
     output_dir = OUTPUT / module.basename()
     output_dir.mkdir_p()
 
@@ -144,23 +192,76 @@ def process_module(module):
         process_resource(dir, output_dir)
 
 def main():
+    global SOURCE
+    global OUTPUT
+    global STYLE_FILE
+    global STYLE_IMAGES
+    global CHM
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-s', '--style', required=True, help="Style sheet for docs")
+    parser.add_argument('docs_source', help="QT docs source directory")
+    parser.add_argument('docs_out', help="Output directory for chm files")
+    args = parser.parse_args()
+
+    SOURCE = Path(args.docs_source).abspath()
+    OUTPUT = Path(args.docs_out).abspath()
+    STYLE_FILE = Path(args.style).abspath()
+
+    with open(SOURCE / 'qtdoc' / 'qtdoc.index', encoding='utf-8') as r:
+        qt_version = re.search(r'<INDEX.*version="(.*?)"', r.read())
+
+        if not qt_version:
+            raise RuntimeError("Failed to parse QT Docs version")
+
+        qt_version = qt_version.group(1)
+
+    STYLE_IMAGES = (
+        "ico_out.png",
+        "ico_note.png",
+        "ico_note_attention.png",
+        "btn_prev.png",
+        "btn_next.png",
+        "home.png",
+        "arrow_bc.png",
+        "bgrContent.png",
+        "bullet_dn.png",
+        "bullet_sq.png",
+        "logo.png",
+    )
+
+    CHM = chm.DocChm(f'Qt-{qt_version}', default_topic='qtdoc/index.html', title=f'Qt {qt_version}')
+
+    OUTPUT.mkdir_p()
+
+    images_dir = OUTPUT / 'images'
+
+    images_dir.mkdir_p()
+
+    for image in STYLE_IMAGES:
+        shutil.copy(SOURCE / 'qtdoc' / 'images' / image, images_dir / image)
+
     # put qtdoc first
     process_module(SOURCE / 'qtdoc')
 
+    excluded_dirs = ('config', 'global', 'qtdoc')
+
     for module in SOURCE.dirs():
-        if module.basename() != 'qtdoc':
+        if module.basename() not in excluded_dirs:
             process_module(module)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-f', '--force', action='store_true', help='Force process HTML')
-    args = parser.parse_args()
+    shutil.copy(STYLE_FILE, OUTPUT / STYLE_FILE.basename())
 
-    OUTPUT.mkdir_p()
-    main()
-    ostyle = OUTPUT / 'style.css'
-    if not ostyle.exists():
-        subprocess.call(['cmd.exe', 'mklink', ostyle, abspath('style.css')])
-    CHM.append('style.css')
+    for image in STYLE_IMAGES:
+        CHM.append(f"images\{image}")
+
+    CHM.append(STYLE_FILE.basename())
+
     with OUTPUT:
         CHM.save()
+
+    print(f"QT Docs v.{qt_version} are ready for CHM compilation")
+
+
+if __name__ == '__main__':
+    main()
