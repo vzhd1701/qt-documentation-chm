@@ -254,6 +254,8 @@ class Project:
             'language': '0x409 English (United States)',
             'default_window': 'main',
             'binary_index': 'No',  # with binary index, multi topic keyword will not be displayed
+            'Full-text search': 'Yes',
+            'Binary TOC': 'Yes',
         }
         self.window = Window(self, 'main')
         self.options.update(kwargs)
