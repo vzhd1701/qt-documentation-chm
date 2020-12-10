@@ -78,6 +78,15 @@ def parse_file_toc(file, parent):
 def process_section(elem, parent, module):
     for section in elem.findall('section'):
         title = section.get('title').strip()
+
+        # qtcore5 empty ref workaround
+        if module.basename() in ("qtcore5", "qtcore5compat") and title == "C++ Classes" and not section.get('ref'):
+            title = ""
+
+        # nonexistant
+        if module.basename() == "qtshadertools" and title == "Examples" and not section.get('ref'):
+            continue
+
         # title could be empty
         if title:
             # Workaround, there is only 1 glitch like this so far in qtdatavisualization\qtdatavis3d.qhp
